@@ -1,0 +1,434 @@
+Context Propagation in Distributed Tracing
+Lab Objectives
+By the end of this lab, students will be able to:
+
+Understand the importance of trace context propagation in distributed systems
+Implement the W3C Trace Context standard for maintaining trace continuity across services
+Configure OpenTelemetry for automatic context propagation with Flask and requests
+Track a single distributed trace across three cooperating microservices
+Analyze trace data in Jaeger to verify context propagation and identify latency in the request chain
+Prerequisites
+Before starting this lab, students should have:
+
+Basic understanding of microservices architecture
+Familiarity with HTTP requests and responses
+Knowledge of Python programming fundamentals
+Experience with command-line operations in Linux
+Basic knowledge of containerization concepts (Docker)
+This lab uses a Linux machine with Python 3.8+ and Docker available. Install the required tools with the following commands:
+
+sudo apt update
+sudo apt install -y python3 python3-pip python3-venv curl docker.io docker-compose
+sudo systemctl start docker
+sudo systemctl enable docker
+sudo usermod -aG docker $USER
+Log out and back in for the Docker group change to take effect, then verify:
+
+docker --version
+docker-compose --version
+Create a working directory and Python virtual environment:
+
+mkdir -p ~/tracing-lab
+cd ~/tracing-lab
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install flask==3.0.3 requests==2.32.3 \
+  opentelemetry-api==1.27.0 \
+  opentelemetry-sdk==1.27.0 \
+  opentelemetry-instrumentation-flask==0.48b0 \
+  opentelemetry-instrumentation-requests==0.48b0 \
+  opentelemetry-exporter-jaeger==1.21.0
+Note: opentelemetry-exporter-jaeger is deprecated upstream in favor of OTLP, but it remains fully functional and is used here because it requires no collector configuration beyond the Jaeger all-in-one image, keeping the lab focused on context propagation rather than exporter setup.
+
+Remember to run source ~/tracing-lab/venv/bin/activate in every new terminal session before running any Python command in this lab.
+
+Task 1: Set Up the Tracing Backend
+Subtask 1.1: Start Jaeger with Docker Compose
+Create a Docker Compose file for the Jaeger all-in-one image:
+
+cd ~/tracing-lab
+cat > docker-compose.yml << 'EOF'
+version: '3.8'
+services:
+  jaeger:
+    image: jaegertracing/all-in-one:1.58
+    ports:
+      - "16686:16686"
+      - "14268:14268"
+      - "6831:6831/udp"
+      - "6832:6832/udp"
+    environment:
+      - COLLECTOR_ZIPKIN_HOST_PORT=:9411
+networks:
+  default:
+    name: tracing-network
+EOF
+Start Jaeger:
+
+docker-compose up -d
+docker-compose ps
+Deliverable / expected result: docker-compose ps shows the jaeger container with state Up. Confirm the UI is reachable:
+
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:16686
+This should print 200.
+
+Subtask 1.2: Verify Jaeger API Access
+Check the Jaeger query API for registered services (it will be empty until Task 2 sends traces):
+
+curl -s http://localhost:16686/api/services | python3 -m json.tool
+Deliverable / expected result: valid JSON output of the form {"data": [], "total": 0, ...} (or "data": null in some Jaeger versions when no traces exist yet). This confirms the Jaeger query API is up and ready to receive and serve trace data before you deploy your services.
+
+Task 2: Build a Three-Service Distributed Trace
+Subtask 2.1: Create the Inventory Service (innermost service)
+Create the directory structure and the innermost service first, since the other two depend on it:
+
+cd ~/tracing-lab
+mkdir -p services/inventory-service services/order-service services/user-service
+Write the inventory service:
+
+cat > services/inventory-service/app.py << 'EOF'
+from flask import Flask, request, jsonify
+import logging
+import random
+import time
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.jaeger.thrift import JaegerExporter
+from opentelemetry.instrumentation.flask import FlaskInstrumentor
+from opentelemetry.propagate import extract
+from opentelemetry.sdk.resources import Resource
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+resource = Resource.create({"service.name": "inventory-service", "service.version": "1.0.0"})
+provider = TracerProvider(resource=resource)
+trace.set_tracer_provider(provider)
+tracer = trace.get_tracer(__name__)
+
+jaeger_exporter = JaegerExporter(agent_host_name="localhost", agent_port=6831)
+provider.add_span_processor(BatchSpanProcessor(jaeger_exporter))
+
+app = Flask(__name__)
+FlaskInstrumentor().instrument_app(app)
+
+@app.route('/inventory/order/<order_id>')
+def check_inventory(order_id):
+    context = extract(request.headers)
+    with tracer.start_as_current_span("check_inventory", context=context) as span:
+        span.set_attribute("order.id", order_id)
+        span.set_attribute("service.name", "inventory-service")
+        logger.info(f"Checking inventory for order: {order_id}")
+
+        with tracer.start_as_current_span("database_lookup") as db_span:
+            db_span.set_attribute("db.operation", "SELECT")
+            db_span.set_attribute("db.table", "inventory")
+            lookup_time = random.uniform(0.05, 0.2)
+            time.sleep(lookup_time)
+            db_span.set_attribute("db.duration_ms", lookup_time * 1000)
+
+        available = random.choice([True, True, True, False])
+        quantity = random.randint(1, 100) if available else 0
+
+        span.set_attribute("inventory.available", available)
+        span.set_attribute("inventory.quantity", quantity)
+        if not available:
+            span.add_event("Inventory out of stock", {"order.id": order_id})
+
+        result = {
+            "order_id": order_id,
+            "available": available,
+            "quantity": quantity,
+            "warehouse": f"warehouse_{random.randint(1, 3)}"
+        }
+        return jsonify(result)
+
+@app.route('/health')
+def health():
+    return jsonify({"status": "healthy", "service": "inventory-service"})
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5003)
+EOF
+Subtask 2.2: Create the Order Service (middle service)
+cat > services/order-service/app.py << 'EOF'
+from flask import Flask, request, jsonify
+import requests
+import logging
+import random
+import time
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.jaeger.thrift import JaegerExporter
+from opentelemetry.instrumentation.flask import FlaskInstrumentor
+from opentelemetry.instrumentation.requests import RequestsInstrumentor
+from opentelemetry.propagate import inject, extract
+from opentelemetry.sdk.resources import Resource
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+resource = Resource.create({"service.name": "order-service", "service.version": "1.0.0"})
+provider = TracerProvider(resource=resource)
+trace.set_tracer_provider(provider)
+tracer = trace.get_tracer(__name__)
+
+jaeger_exporter = JaegerExporter(agent_host_name="localhost", agent_port=6831)
+provider.add_span_processor(BatchSpanProcessor(jaeger_exporter))
+
+app = Flask(__name__)
+FlaskInstrumentor().instrument_app(app)
+RequestsInstrumentor().instrument()
+
+@app.route('/orders/user/<user_id>')
+def get_user_orders(user_id):
+    context = extract(request.headers)
+    with tracer.start_as_current_span("get_user_orders", context=context) as span:
+        span.set_attribute("user.id", user_id)
+        span.set_attribute("service.name", "order-service")
+        logger.info(f"Processing order request for user: {user_id}")
+
+        time.sleep(random.uniform(0.1, 0.3))
+
+        orders = []
+        order_count = random.randint(1, 3)
+
+        for i in range(order_count):
+            order_id = f"order_{user_id}_{i + 1}"
+            with tracer.start_as_current_span("process_individual_order") as order_span:
+                order_span.set_attribute("order.id", order_id)
+                try:
+                    headers = {}
+                    inject(headers)
+                    response = requests.get(
+                        f"http://localhost:5003/inventory/order/{order_id}",
+                        headers=headers,
+                        timeout=5
+                    )
+                    if response.status_code == 200:
+                        inventory_data = response.json()
+                        order_span.set_attribute("inventory.available", inventory_data.get("available", False))
+                    else:
+                        inventory_data = {"available": False, "error": "service_unavailable"}
+                        order_span.set_attribute("inventory.error", True)
+                except Exception as e:
+                    order_span.record_exception(e)
+                    logger.error(f"Error calling inventory service: {e}")
+                    inventory_data = {"available": False, "error": str(e)}
+
+                orders.append({
+                    "id": order_id,
+                    "user_id": user_id,
+                    "amount": round(random.uniform(10.0, 500.0), 2),
+                    "status": "completed",
+                    "inventory": inventory_data
+                })
+
+        span.set_attribute("orders.count", len(orders))
+        return jsonify(orders)
+
+@app.route('/health')
+def health():
+    return jsonify({"status": "healthy", "service": "order-service"})
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5002)
+EOF
+Subtask 2.3: Create the User Service (entry point)
+cat > services/user-service/app.py << 'EOF'
+from flask import Flask, request, jsonify
+import requests
+import logging
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.jaeger.thrift import JaegerExporter
+from opentelemetry.instrumentation.flask import FlaskInstrumentor
+from opentelemetry.instrumentation.requests import RequestsInstrumentor
+from opentelemetry.propagate import inject
+from opentelemetry.sdk.resources import Resource
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+resource = Resource.create({"service.name": "user-service", "service.version": "1.0.0"})
+provider = TracerProvider(resource=resource)
+trace.set_tracer_provider(provider)
+tracer = trace.get_tracer(__name__)
+
+jaeger_exporter = JaegerExporter(agent_host_name="localhost", agent_port=6831)
+provider.add_span_processor(BatchSpanProcessor(jaeger_exporter))
+
+app = Flask(__name__)
+FlaskInstrumentor().instrument_app(app)
+RequestsInstrumentor().instrument()
+
+@app.route('/user/<user_id>')
+def get_user(user_id):
+    with tracer.start_as_current_span("get_user_operation") as span:
+        span.set_attribute("user.id", user_id)
+        span.set_attribute("service.name", "user-service")
+        logger.info(f"Processing request for user: {user_id}")
+
+        user_data = {
+            "id": user_id,
+            "name": f"User {user_id}",
+            "email": f"user{user_id}@example.com"
+        }
+
+        try:
+            headers = {}
+            inject(headers)
+            logger.info(f"Calling order service with headers: {headers}")
+
+            response = requests.get(
+                f"http://localhost:5002/orders/user/{user_id}",
+                headers=headers,
+                timeout=5
+            )
+
+            if response.status_code == 200:
+                user_data["orders"] = response.json()
+                span.set_attribute("orders.count", len(user_data["orders"]))
+            else:
+                span.set_attribute("orders.error", True)
+                user_data["orders"] = []
+
+        except Exception as e:
+            span.record_exception(e)
+            span.set_attribute("orders.error", True)
+            logger.error(f"Error calling order service: {e}")
+            user_data["orders"] = []
+
+        return jsonify(user_data)
+
+@app.route('/health')
+def health():
+    return jsonify({"status": "healthy", "service": "user-service"})
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5001)
+EOF
+Deliverable for Task 2: three complete Flask applications under ~/tracing-lab/services/, each instrumented with OpenTelemetry, each exporting to the same Jaeger instance, and each using inject/extract from opentelemetry.propagate to pass the W3C Trace Context traceparent header between services.
+
+Task 3: Run the System and Verify Context Propagation
+Subtask 3.1: Start All Three Services
+Open three separate terminal sessions (or use tmux/background processes), activate the virtual environment in each, and start one service per terminal:
+
+# Terminal 1
+cd ~/tracing-lab && source venv/bin/activate
+cd services/inventory-service && python3 app.py
+# Terminal 2
+cd ~/tracing-lab && source venv/bin/activate
+cd services/order-service && python3 app.py
+# Terminal 3
+cd ~/tracing-lab && source venv/bin/activate
+cd services/user-service && python3 app.py
+If you prefer a single terminal, use a startup script instead:
+
+cd ~/tracing-lab
+cat > start_services.sh << 'EOF'
+#!/bin/bash
+source venv/bin/activate
+
+cd services/inventory-service
+python3 app.py > ~/tracing-lab/inventory.log 2>&1 &
+echo $! > ~/tracing-lab/inventory.pid
+
+cd ../order-service
+python3 app.py > ~/tracing-lab/order.log 2>&1 &
+echo $! > ~/tracing-lab/order.pid
+
+cd ../user-service
+python3 app.py > ~/tracing-lab/user.log 2>&1 &
+echo $! > ~/tracing-lab/user.pid
+
+echo "Services starting. Waiting 5 seconds..."
+sleep 5
+echo "user-service:      http://localhost:5001"
+echo "order-service:     http://localhost:5002"
+echo "inventory-service: http://localhost:5003"
+EOF
+chmod +x start_services.sh
+./start_services.sh
+And a matching stop script:
+
+cat > stop_services.sh << 'EOF'
+#!/bin/bash
+for f in inventory.pid order.pid user.pid; do
+  if [ -f ~/tracing-lab/$f ]; then
+    kill "$(cat ~/tracing-lab/$f)" 2>/dev/null
+    rm ~/tracing-lab/$f
+  fi
+done
+echo "All services stopped"
+EOF
+chmod +x stop_services.sh
+Verify all three services are healthy:
+
+curl -s http://localhost:5001/health
+curl -s http://localhost:5002/health
+curl -s http://localhost:5003/health
+Deliverable / expected result: each health check returns JSON similar to {"service": "user-service", "status": "healthy"} with the matching service name and port.
+
+Subtask 3.2: Generate a Distributed Trace
+Send a request that flows through all three services:
+
+curl -s http://localhost:5001/user/1001 | python3 -m json.tool
+Deliverable / expected result: a JSON response containing id, name, email, and an orders array. Each order object contains an inventory field populated by the inventory service, proving all three services executed within the same request:
+
+{
+    "id": "1001",
+    "name": "User 1001",
+    "email": "user1001@example.com",
+    "orders": [
+        {
+            "id": "order_1001_1",
+            "user_id": "1001",
+            "amount": 123.45,
+            "status": "completed",
+            "inventory": {
+                "order_id": "order_1001_1",
+                "available": true,
+                "quantity": 42,
+                "warehouse": "warehouse_2"
+            }
+        }
+    ]
+}
+Generate a few more requests for varied trace data:
+
+for i in 1 2 3 4 5; do
+  curl -s "http://localhost:5001/user/200$i" > /dev/null
+  sleep 1
+done
+Subtask 3.3: Verify Trace Continuity in Jaeger
+Query the Jaeger API directly to confirm the trace spans multiple services:
+
+curl -s "http://localhost:16686/api/services" | python3 -m json.tool
+Deliverable / expected result: the data array now lists "user-service", "order-service", and "inventory-service", confirming all three services reported spans to the same backend.
+
+Fetch recent traces for the user-service and inspect the span count:
+
+curl -s "http://localhost:16686/api/traces?service=user-service&limit=5" | python3 -m json.tool | head -60
+In the JSON output, find a single trace object under data and confirm its spans array includes entries whose process.serviceName values are user-service, order-service, and inventory-service, and that every span shares the same traceID. This is the definitive proof of context propagation: a single traceID value connects independently generated spans across three separate Python processes.
+
+For visual verification, open the Jaeger UI (use your machine's external IP if accessing remotely, port 16686):
+
+echo "Jaeger UI: http://localhost:16686"
+In the UI: select user-service from the Service dropdown, click Find Traces, open the most recent trace, and confirm the timeline view shows nested spans from user-service, order-service, and inventory-service under a single trace, with process_individual_order and database_lookup spans nested beneath the service-level spans.
+
+Deliverable for Task 3: at least one trace visible in the Jaeger UI (or via the /api/traces endpoint) whose spans include all three services under a single traceID, along with the JSON output from Subtask 3.2 showing the fully populated nested response.
+
+Expected Outcomes
+Three independently running Flask services that automatically propagate W3C Trace Context (traceparent header) across HTTP calls using OpenTelemetry's inject/extract functions
+A verified end-to-end trace in Jaeger showing a single traceID spanning user-service, order-service, and inventory-service, with correctly nested parent-child spans
+Practical experience reading span attributes (user.id, order.id, inventory.available) and using the Jaeger UI and query API to confirm propagation succeeded
+Troubleshooting
+Symptom: traces show up per-service but never combine into a single multi-service trace in Jaeger. Diagnostic hint: check that inject(headers) is called before the outbound requests.get() call and that the receiving service calls extract(request.headers) and passes the resulting context into start_as_current_span. A missing inject or extract call breaks the parent-child link even though each service still reports spans independently.
+Symptom: curl http://localhost:5001/user/<id> hangs or returns a connection error referencing port 5002 or 5003. Diagnostic hint: confirm all three Flask processes are actually running (ps aux | grep app.py) and that no other process is already bound to ports 5001-5003 (ss -tlnp | grep -E '5001|5002|5003'); a downstream service that failed to start silently breaks the chain even though the entry-point service still responds with an empty orders list.
+Conclusion
+In this lab, students built a three-service distributed system in Flask and instrumented it with OpenTelemetry to propagate W3C Trace Context across HTTP boundaries using the inject and extract propagation API. By manually injecting the traceparent header on outbound calls and extracting it on inbound requests, each service was able to contribute spans to a single shared trace, which was verified both through direct inspection of the Jaeger API's traceID field and visually in the Jaeger UI's trace timeline. Students should now understand why context propagation is the foundation of distributed tracing: without it, each service would only ever produce isolated, disconnected spans, making it impossible to reconstruct the true path and latency profile of a request as it moves through a microservice architecture. As a next step, students can extend this lab by adding baggage propagation for cross-cutting metadata such as user tier or request source, or by introducing deliberate latency and error conditions in the inventory service to practice diagnosing bottlenecks using the same trace data.
